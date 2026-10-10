@@ -1,0 +1,171 @@
+# BOX — Build Spec
+
+A brief for building the BOX translator software. Everything here about the hardware has been tested and confirmed working on the actual device.
+
+---
+
+## What BOX is
+
+A small box with one button. Someone holds the button and talks. When they let go, the box says the same thing out loud in the other language.
+
+Spanish in → English out. English in → Spanish out.
+
+It is for small shops where the owner and the customer don't share a language. No phone, no app, no pairing. One button.
+
+---
+
+## How it works, step by step
+
+1. Box is idle. LEDs are **red**.
+2. Someone **holds** the button. LEDs turn **green**. Recording starts.
+3. They talk.
+4. They **release** the button. Recording stops.
+5. LEDs turn **amber**. The WAV file is sent to the cloud.
+6. Cloud transcribes it and reports which language it was.
+7. If it was Spanish → translate to English. If English → translate to Spanish.
+8. Cloud turns the translation into speech and sends audio back.
+9. LEDs turn **blue**. The box plays the audio out loud.
+10. LEDs go back to **red**. Ready for the next turn.
+
+On any failure, flash **red** three times and return to idle. Never leave the LEDs dark — the user has no screen and dark means "broken" to them.
+
+**Important:** The box never decides which language. The transcription service reports the detected language, and that decides the direction. Do not add a separate language-detection step.
+
+---
+
+## Hardware (all verified working)
+
+| Thing | Detail |
+|---|---|
+| Computer | Raspberry Pi 3B+, Raspberry Pi OS Lite 64-bit (Debian Trixie) |
+| Kernel | 6.18.50+rpt-rpi-v8 |
+| Sound board | ReSpeaker 2-Mics Pi HAT **v2.0** |
+| Codec | TLV320AIC3104 at I2C address 0x18 |
+| Overlay | `dtoverlay=respeaker-2mic-v2_0` (already installed) |
+| Microphones | ALSA **card 1**, `seeed2micvoicec` |
+| Speaker out | ALSA **card 0**, `bcm2835 Headphones` — the Pi's own 3.5 mm jack |
+| Button | GPIO17, active low |
+| LEDs | 3× APA102 RGB on the SPI bus |
+
+### Why playback uses the Pi's jack, not the HAT
+
+The HAT has a speaker socket but it is JST-PH 2.0 mm and the speakers we have are 1.25 mm — they physically don't fit. The HAT's amp is also only about 1 W, too quiet for a shop counter. So audio goes out the Pi's 3.5 mm jack into a powered speaker.
+
+Record from card 1. Play to card 0. Both work at the same time.
+
+### Confirmed working commands
+
+Record 5 seconds:
+```bash
+arecord -D plughw:1,0 -f S16_LE -r 16000 -c 2 -d 5 test.wav
+```
+
+Play a file:
+```bash
+aplay -D plughw:0,0 test.wav
+```
+
+---
+
+## Constraints
+
+- **The Pi 3B+ cannot run speech recognition locally.** 1 GB RAM, no NPU. All transcription, translation, and speech synthesis happens in the cloud. Do not try to run Whisper on the device.
+- **Network is an iPhone hotspot.** It can be slow and can drop. Every network call needs a timeout and a clean failure path.
+- **16 kHz mono is enough.** That's the speech band these models expect. Don't record at higher rates "for quality" — it just makes uploads slower.
+- **No screen.** The LEDs are the entire user interface.
+
+---
+
+## Project layout
+
+```
+box-translator/
+├── .env                 # API key — NEVER commit this
+├── .env.example         # template with no real key
+├── .gitignore
+├── README.md
+├── requirements.txt
+├── main.py              # the loop that ties everything together
+├── hardware/
+│   ├── button.py        # GPIO17 hold-to-talk
+│   ├── leds.py          # the four LED states
+│   ├── recorder.py      # start/stop recording to a WAV
+│   └── player.py        # play a file out the 3.5 mm jack
+└── cloud/
+    └── translate.py     # audio in → translated audio out
+```
+
+Keep `cloud/translate.py` as the only file that knows about the API. If we switch providers later, that's the one file that changes.
+
+---
+
+## Build order
+
+Build and test these in order. Steps 1–4 need no API key and no speaker — test playback with any headphones in the Pi's 3.5 mm jack.
+
+**1. `hardware/leds.py`**
+Four functions: `idle()` red, `listening()` green, `working()` amber, `speaking()` blue, plus `error()` which flashes red. Test by calling each one.
+
+**2. `hardware/button.py`**
+Detect hold and release on GPIO17. Use `gpiozero`. Button is active low.
+
+**3. `hardware/recorder.py`**
+`start()` begins recording to a WAV, `stop()` ends it and returns the file path. Simplest approach: launch `arecord` with `subprocess.Popen` on start, terminate it on stop. Record 16 kHz.
+
+**4. `hardware/player.py`**
+Play a given audio file out card 0 using `aplay`. Blocks until done.
+
+At this point: hold the button, LEDs go green, talk, release, and a WAV lands on disk. That alone should be committed and working before touching the cloud.
+
+**5. `cloud/translate.py`**
+One function: give it a WAV path, get back the path to an audio file with the translation spoken.
+
+Inside it:
+- Transcribe the WAV. The response must include the detected language.
+- If the language is Spanish, translate to English. Otherwise translate to Spanish.
+- Turn the translated text into speech and save the audio.
+- Return the path.
+
+Recommended: OpenAI. Whisper returns the detected language alongside the transcript, which is exactly what this design needs, and one provider covers transcription, translation, and text-to-speech. API key goes in `.env` as `OPENAI_API_KEY`.
+
+**6. `main.py`**
+The loop that wires it together, following the ten steps above.
+
+---
+
+## Rules
+
+- **Never commit the API key.** It goes in `.env`, and `.env` is in `.gitignore`. A key pushed to GitHub gets found and abused by bots within minutes.
+- **Never use the `seeed-voicecard` installer.** That is for the older v1.0 board with a different chip. It breaks current Raspberry Pi OS and makes the sound card undetectable. The device tree overlay is already correctly installed — don't reinstall drivers.
+- **Every cloud call needs a timeout.** If the network hangs, the box must flash red and go back to idle, not freeze.
+- **Print what's happening.** While developing, log each step to the terminal. With no screen, that's the only way to see where it failed.
+
+---
+
+## How to test without a speaker
+
+Plug any headphones or earbuds into the Pi's 3.5 mm jack. That is the same output path a powered speaker will use. The full loop can be tested end to end today.
+
+---
+
+## Known risk
+
+A kernel bug was reported on 5 October 2026 where opening audio on a TLV320AIC3104 card fails with EINVAL on kernel 6.18.50. It was filed against a Raspberry Pi 5. **This Pi 3B+ is not affected** — recording has been tested and works. If a future OS update makes the sound card appear in `arecord -l` but refuse to record, that bug is the cause, and pinning to kernel 6.18.39 is the fix.
+
+---
+
+## Device access
+
+```
+ssh box_tech@BOXtech.local
+```
+
+The Pi only looks for wifi when it boots, so the hotspot must be on before the Pi powers up.
+
+Always shut down properly before unplugging:
+
+```bash
+sudo shutdown -h now
+```
+
+Wait for the green LED to go dark. Pulling power while it's writing corrupts the SD card.
